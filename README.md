@@ -59,3 +59,7 @@ Intended for omp coding hosts (Linux/macOS) running herdr/omp panes. Not a subst
 MIT. See [LICENSE](LICENSE).
 
 Copyright (c) 2026 Joshua Warren (companion extension only). Upstream Unlazy © Leonxlnx.
+
+## Changelog
+
+- **COS-151:** Spawn real `node` for gate-check (inside omp, `process.execPath` is the omp binary, which rejected `--status`/`--root`).

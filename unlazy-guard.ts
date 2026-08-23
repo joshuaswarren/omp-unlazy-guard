@@ -15,16 +15,33 @@
 // Approvals remain under ~/.unlazy/approved (outside repo). CHECKs use ambient creds.
 //
 // Deploy: ~/.omp/agent/extensions/unlazy-guard.ts (omp auto-discovers).
+// COS-151: always spawn real `node` (process.execPath inside omp is the omp binary).
 // Source: homelab-infra/scripts/omp-unlazy-guard/ + skillsharesync omp-unlazy-guard/.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const MAX_BLOCKS = 6;
 const STATUS_TIMEOUT_MS = 8000;
 const ENV_SKILL = process.env.UNLAZY_SKILL_ROOT;
+
+/** omp extensions run under the omp binary, so process.execPath is often `omp`, not node. */
+function resolveNodeBin(): string {
+	const exec = process.execPath || "";
+	const base = basename(exec).toLowerCase();
+	if (base === "node" || base === "node.exe") return exec;
+	const fromEnv = process.env.UNLAZY_NODE_BIN;
+	if (fromEnv && existsSync(fromEnv)) return fromEnv;
+	for (const candidate of ["/usr/bin/node", "/usr/local/bin/node", join(homedir(), ".local", "bin", "node")]) {
+		if (existsSync(candidate)) return candidate;
+	}
+	const which = spawnSync("command", ["-v", "node"], { encoding: "utf8", shell: true });
+	const hit = (which.stdout || "").trim().split("\n")[0];
+	if (hit && existsSync(hit)) return hit;
+	return "node";
+}
 
 function skillRoot(): string | null {
 	const candidates = [
@@ -60,7 +77,7 @@ function runNode(args: string[], cwd: string, timeoutMs: number): Promise<{ code
 		settled = true;
 		resolve(value);
 	};
-	const child = spawn(process.execPath, args, {
+	const child = spawn(resolveNodeBin(), args, {
 		cwd,
 		stdio: ["ignore", "pipe", "pipe"],
 		env: process.env,
@@ -85,7 +102,12 @@ function runNode(args: string[], cwd: string, timeoutMs: number): Promise<{ code
 
 function summarizeUnmet(stdout: string, stderr: string, code: number): GateStatus {
 	const text = `${stdout}\n${stderr}`.trim();
+	const infraFail =
+		/unknown flags/i.test(text) ||
+		/Run `omp --help`/i.test(text) ||
+		/ENOENT/i.test(text);
 	const noFiles =
+		infraFail ||
 		/no gate files found/i.test(text) ||
 		(/looked for/i.test(text) && code === 2);
 	const lines = text
