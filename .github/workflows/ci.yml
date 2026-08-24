@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: named-omp-end-of-turn
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install pinned omp (exact 18.0.4, ignore native scripts)
+        run: npm ci --ignore-scripts
+      - name: Assert pin is not a floating range
+        run: node --test tests/omp-version-pin.test.mjs
+      - name: Run tests
+        run: npm test

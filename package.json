@@ -1,0 +1,23 @@
+{
+  "name": "omp-unlazy-guard",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Unofficial third-party omp extension that wires Unlazy gate-check into omp end-of-turn hooks. Not part of Leonxlnx/unlazy.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.0.4"
+  },
+  "ompTestPin": {
+    "package": "@oh-my-pi/pi-coding-agent",
+    "version": "18.0.4",
+    "gitTag": "v18.0.4",
+    "note": "Exact version, not latest or a caret range. End-of-turn tests target this named omp release's session_stop / agent_end / turn_end contract."
+  }
+}

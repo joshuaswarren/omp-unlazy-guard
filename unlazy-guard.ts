@@ -1,34 +1,44 @@
-// unlazy-guard.ts — omp/pi extension giving live omp panes Unlazy coverage
-// equivalent-or-better than Claude Code's Stop hook.
+// unlazy-guard.ts — unofficial third-party omp/pi extension.
+// Not affiliated with, endorsed by, or part of Leonxlnx/unlazy.
+// Not an official Unlazy companion. Gate CHECK/EXPECT stay in upstream
+// gate-check.mjs; this file only adds omp lifecycle hooks and slash commands.
 //
 // Claude ~/.claude/settings.json Stop does NOT run inside omp (Oh My Pi).
 // This extension:
-//   - before_agent_start: inject reminder when GATES ledgers have unmet items
-//   - agent_end: re-prompt (sendMessage) while unmet, with MaxBlocks release
-//   - tool_call: block bash that runs gate-check mutating modes without --root
-//     safety; allow status; surface approve/reverify via commands/tools
+//   - before_agent_start / turn_start: reminder when GATES ledgers have unmet items
+//   - session_stop (omp 18.x settle hook): continue while unmet, MaxBlocks release
+//   - agent_end: fallback sendMessage on hosts that never emit session_stop
+//   - turn_end: status only — not a settle hook
+//   - tool_call: block bash that runs mutating gate-check without --root/--scope
 //   - registerCommand: unlazy-status | unlazy-reverify | unlazy-approve | unlazy-scopes
 //   - registerTool: unlazy_status (agent-callable)
-//   - Depth Tree: --list-scopes + scoped --status when .unlazy/ present
+//   - /unlazy-approve and /unlazy-reverify are inspect-then-confirm
 //
-// Gate execution stays in upstream gate-check.mjs (skillshare unlazy skill).
 // Approvals remain under ~/.unlazy/approved (outside repo). CHECKs use ambient creds.
-//
 // Deploy: ~/.omp/agent/extensions/unlazy-guard.ts (omp auto-discovers).
 // COS-151: always spawn real `node` (process.execPath inside omp is the omp binary).
-// Source: homelab-infra/scripts/omp-unlazy-guard/ + skillsharesync omp-unlazy-guard/.
+// COS-176: session_stop + inspect-then-confirm + documented transcripts/OS scope.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-const MAX_BLOCKS = 6;
-const STATUS_TIMEOUT_MS = 8000;
+export const MAX_BLOCKS = 6;
+export const STATUS_TIMEOUT_MS = 8000;
+/** Host this companion's end-of-turn tests pin. Not a floating "latest". */
+export const PINNED_OMP_VERSION = "18.0.4";
 const ENV_SKILL = process.env.UNLAZY_SKILL_ROOT;
 
+export type SlashMode = "inspect" | "confirm" | "help" | "unknown";
+
+export type EndOfTurnDecision =
+	| { action: "noop"; reason: string }
+	| { action: "continue"; message: string; blocks: number; hash: string }
+	| { action: "release"; message: string };
+
 /** omp extensions run under the omp binary, so process.execPath is often `omp`, not node. */
-function resolveNodeBin(): string {
+export function resolveNodeBin(): string {
 	const exec = process.execPath || "";
 	const base = basename(exec).toLowerCase();
 	if (base === "node" || base === "node.exe") return exec;
@@ -41,6 +51,68 @@ function resolveNodeBin(): string {
 	const hit = (which.stdout || "").trim().split("\n")[0];
 	if (hit && existsSync(hit)) return hit;
 	return "node";
+}
+
+export function parseSlashMode(args: string | undefined): SlashMode {
+	const token = String(args || "")
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean)[0]
+		?.toLowerCase();
+	if (!token || token === "inspect" || token === "show" || token === "preview") return "inspect";
+	if (token === "confirm" || token === "run" || token === "execute") return "confirm";
+	if (token === "help" || token === "-h" || token === "--help") return "help";
+	return "unknown";
+}
+
+export function mutatingGateCheckLacksRoot(command: string): boolean {
+	if (!command.includes("gate-check.mjs")) return false;
+	const mutating = /\s--approve\b|\s--reverify\b/.test(` ${command} `);
+	if (!mutating) return false;
+	if (/\s--root\b|\s--scope\b|\sGATES\.md\b|\sgates\//.test(command)) return false;
+	return true;
+}
+
+export function decideEndOfTurn(input: {
+	hasLedger: boolean;
+	ok: boolean;
+	unmetHint: string;
+	stopHookActive?: boolean;
+	willContinue?: boolean;
+	prev?: { hash: string; blocks: number };
+}): EndOfTurnDecision {
+	if (input.stopHookActive) return { action: "noop", reason: "stop_hook_active" };
+	if (input.willContinue) return { action: "noop", reason: "willContinue" };
+	if (!input.hasLedger || input.ok) return { action: "noop", reason: "gates-met-or-absent" };
+	const hash = input.unmetHint.slice(0, 120);
+	const next =
+		!input.prev || input.prev.hash !== hash
+			? { hash, blocks: 1 }
+			: { hash, blocks: input.prev.blocks + 1 };
+	if (next.blocks > MAX_BLOCKS) {
+		return {
+			action: "release",
+			message:
+				`unlazy-guard (third-party): releasing after ${MAX_BLOCKS} end-of-turn blocks without gate progress; ` +
+				`${input.unmetHint}`,
+		};
+	}
+	return {
+		action: "continue",
+		blocks: next.blocks,
+		hash: next.hash,
+		message: reminderText(
+			{
+				ok: false,
+				exitCode: 1,
+				stdout: "",
+				stderr: "",
+				unmetHint: input.unmetHint,
+				hasLedger: true,
+			},
+			` [block ${next.blocks}/${MAX_BLOCKS}]`,
+		),
+	};
 }
 
 function skillRoot(): string | null {
@@ -60,7 +132,7 @@ function gateCheckBin(root: string): string {
 	return join(root, "scripts", "gate-check.mjs");
 }
 
-interface GateStatus {
+export interface GateStatus {
 	ok: boolean;
 	exitCode: number;
 	stdout: string;
@@ -100,7 +172,7 @@ function runNode(args: string[], cwd: string, timeoutMs: number): Promise<{ code
 	return promise;
 }
 
-function summarizeUnmet(stdout: string, stderr: string, code: number): GateStatus {
+export function summarizeUnmet(stdout: string, stderr: string, code: number): GateStatus {
 	const text = `${stdout}\n${stderr}`.trim();
 	const infraFail =
 		/unknown flags/i.test(text) ||
@@ -161,18 +233,88 @@ async function listScopes(cwd: string): Promise<string> {
 	return (result.stdout || result.stderr || `exit ${result.code}`).trim();
 }
 
-function reminderText(status: GateStatus, where: string): string {
+export function reminderText(status: GateStatus, where: string): string {
 	return (
-		`unlazy${where}: ${status.unmetHint}. ` +
+		`unlazy-guard (third-party)${where}: ${status.unmetHint}. ` +
 		`Do not claim done. Run skill://unlazy / gate-check: ` +
 		`node <unlazy>/scripts/gate-check.mjs --status --root . ` +
-		`(mutating CHECK needs --approve; approvals under ~/.unlazy/approved). ` +
+		`(mutating CHECK needs inspect then /unlazy-approve confirm; approvals under ~/.unlazy/approved). ` +
 		`Slash: /unlazy-status /unlazy-reverify /unlazy-approve /unlazy-scopes`
 	);
 }
 
+function isDir(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function ledgerLine(line: string): boolean {
+	return /^\s*(- \[[ xX]\]|CHECK:|EXPECT:|CWD:|SHELL:|ABANDON:)/.test(line) || /^#{1,3} /.test(line);
+}
+
+export function collectLedgerPayload(cwd: string): string {
+	const files: string[] = [];
+	const rootGate = join(cwd, "GATES.md");
+	if (existsSync(rootGate)) files.push(rootGate);
+	const scoped = join(cwd, ".unlazy");
+	if (isDir(scoped)) {
+		for (const name of readdirSync(scoped)) {
+			const scopeDir = join(scoped, name);
+			if (!isDir(scopeDir)) continue;
+			const scopeGate = join(scopeDir, "GATES.md");
+			if (existsSync(scopeGate)) files.push(scopeGate);
+			const gatesDir = join(scopeDir, "gates");
+			if (!isDir(gatesDir)) continue;
+			for (const leaf of readdirSync(gatesDir)) {
+				if (leaf.endsWith(".md")) files.push(join(gatesDir, leaf));
+			}
+		}
+	}
+	if (!files.length) return "(no GATES.md or .unlazy/*/GATES.md in cwd)";
+	return files
+		.map((file) => {
+			const text = readFileSync(file, "utf8");
+			const lines = text.split(/\r?\n/).filter(ledgerLine);
+			return `--- ${file} ---\n${lines.join("\n") || "(no CHECK/EXPECT lines)"}`;
+		})
+		.join("\n\n");
+}
+
+export function formatInspectPayload(opts: {
+	cwd: string;
+	mode: "approve" | "reverify";
+	statusText: string;
+	ledgerText: string;
+}): string {
+	const next =
+		opts.mode === "approve"
+			? "node <unlazy>/scripts/gate-check.mjs --approve --root <cwd>"
+			: "node <unlazy>/scripts/gate-check.mjs --reverify --root <cwd>";
+	return [
+		"unlazy-guard (third-party) inspect — nothing will execute yet.",
+		`cwd: ${opts.cwd}`,
+		`requested: ${opts.mode}`,
+		"Upstream --status (always non-executing):",
+		opts.statusText || "(empty)",
+		"",
+		"Ledger CHECK/EXPECT/CWD/SHELL lines:",
+		opts.ledgerText,
+		"",
+		`If that payload is what you intend, run /unlazy-${opts.mode} confirm`,
+		`which shells out to: ${next}`,
+		"Approvals stay under ~/.unlazy/approved (outside the repo).",
+		"This companion does not reimplement CHECK logic.",
+	].join("\n");
+}
+
 export default function unlazyGuard(pi: any): void {
 	const blocksByCwd = new Map<string, { hash: string; blocks: number }>();
+	const inspectedByCwd = new Map<string, { mode: "approve" | "reverify"; at: number }>();
+	let sawSessionStop = false;
+	let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function cwdOf(ctx: any): string {
 		try {
@@ -181,6 +323,72 @@ export default function unlazyGuard(pi: any): void {
 			/* ignore */
 		}
 		return process.cwd();
+	}
+
+	function cancelFallback(): void {
+		if (fallbackTimer) {
+			clearTimeout(fallbackTimer);
+			fallbackTimer = null;
+		}
+	}
+
+	function applyBlockState(cwd: string, decision: EndOfTurnDecision): void {
+		if (decision.action === "continue") {
+			blocksByCwd.set(cwd, { hash: decision.hash, blocks: decision.blocks });
+			return;
+		}
+		blocksByCwd.delete(cwd);
+	}
+
+	function sendFallback(msg: string, ctx: any): void {
+		try {
+			pi.sendMessage?.(
+				{ role: "user", content: msg, timestamp: Date.now() },
+				{ deliverAs: "nextTurn", triggerTurn: true },
+			);
+		} catch {
+			ctx?.ui?.notify?.(msg, "warning");
+		}
+	}
+
+	async function endOfTurn(kind: "session_stop" | "agent_end", event: any, ctx: any): Promise<any> {
+		const cwd = cwdOf(ctx);
+		const status = await statusFor(cwd);
+		const decision = decideEndOfTurn({
+			hasLedger: status.hasLedger,
+			ok: status.ok,
+			unmetHint: status.unmetHint,
+			stopHookActive: event?.stop_hook_active,
+			willContinue: event?.willContinue,
+			prev: blocksByCwd.get(cwd),
+		});
+		applyBlockState(cwd, decision);
+		if (decision.action === "noop") {
+			if (decision.reason === "gates-met-or-absent") ctx?.ui?.setStatus?.("unlazy", undefined);
+			return;
+		}
+		if (kind === "session_stop") {
+			sawSessionStop = true;
+			cancelFallback();
+			if (decision.action === "release") {
+				ctx?.ui?.notify?.(decision.message, "warning");
+				return;
+			}
+			return { continue: true, additionalContext: decision.message, decision: "block", reason: decision.message };
+		}
+		// agent_end is notification-only on omp 18.x. If session_stop exists, it
+		// owns continuation. If this host never emits session_stop, fall back.
+		if (sawSessionStop) return;
+		cancelFallback();
+		const msg = decision.message;
+		const schedule = ctx?.setTimeout
+			? (fn: () => void) => ctx.setTimeout(fn, 0)
+			: (fn: () => void) => setTimeout(fn, 0);
+		fallbackTimer = schedule(() => {
+			fallbackTimer = null;
+			if (sawSessionStop) return;
+			sendFallback(msg, ctx);
+		});
 	}
 
 	pi.on("before_agent_start", async (_event: unknown, ctx: any) => {
@@ -192,7 +400,7 @@ export default function unlazyGuard(pi: any): void {
 				customType: "unlazy-gates",
 				content: reminderText(status, ""),
 				display: true,
-				attribution: "unlazy-guard",
+				attribution: "unlazy-guard (third-party)",
 			},
 		};
 	});
@@ -208,99 +416,139 @@ export default function unlazyGuard(pi: any): void {
 		ctx?.ui?.notify?.(reminderText(status, "").slice(0, 180), "warning");
 	});
 
-	pi.on("agent_end", async (_event: unknown, ctx: any) => {
+	pi.on("turn_end", async (_event: unknown, ctx: any) => {
+		// turn_end is not settle. Do not continue or sendMessage here.
 		const cwd = cwdOf(ctx);
 		const status = await statusFor(cwd);
 		if (!status.hasLedger || status.ok) {
-			blocksByCwd.delete(cwd);
+			ctx?.ui?.setStatus?.("unlazy", undefined);
 			return;
 		}
-		const hash = status.unmetHint.slice(0, 120);
-		const prev = blocksByCwd.get(cwd);
-		const next = !prev || prev.hash !== hash ? { hash, blocks: 1 } : { hash, blocks: prev.blocks + 1 };
-		blocksByCwd.set(cwd, next);
-		if (next.blocks > MAX_BLOCKS) {
-			const msg =
-				`unlazy: releasing after ${MAX_BLOCKS} end-blocks without gate progress; ` +
-				`${status.unmetHint}`;
-			try {
-				pi.sendMessage?.({
-					role: "user",
-					content: msg,
-					timestamp: Date.now(),
-				});
-			} catch {
-				ctx?.ui?.notify?.(msg, "warning");
-			}
-			blocksByCwd.delete(cwd);
-			return;
-		}
-		const msg = reminderText(status, ` [block ${next.blocks}/${MAX_BLOCKS}]`);
-		try {
-			// Re-prompt so the agent cannot silently settle with unmet gates
-			// (Claude Stop equivalent for omp).
-			pi.sendMessage?.({
-				role: "user",
-				content: msg,
-				timestamp: Date.now(),
-			});
-		} catch {
-			ctx?.ui?.notify?.(msg, "warning");
-		}
+		ctx?.ui?.setStatus?.("unlazy", `unlazy: unmet gates`);
 	});
+
+	pi.on("session_stop", async (event: any, ctx: any) => endOfTurn("session_stop", event, ctx));
+	pi.on("agent_end", async (event: any, ctx: any) => endOfTurn("agent_end", event, ctx));
 
 	pi.on("tool_call", async (event: any) => {
 		if (event?.toolName !== "bash") return;
 		const command = typeof event?.input?.command === "string" ? event.input.command : "";
-		if (!command.includes("gate-check.mjs")) return;
-		// Refuse approve/reverify without an explicit --root or ledger path —
-		// prefer intentional cwd binding (ambient-cred safety reminder).
-		const mutating = /\s--approve\b|\s--reverify\b/.test(` ${command} `);
-		if (!mutating) return;
-		if (/\s--root\b|\s--scope\b|\sGATES\.md\b|\sgates\//.test(command)) return;
+		if (!mutatingGateCheckLacksRoot(command)) return;
 		return {
 			block: true,
 			reason:
-				"unlazy-guard: mutating gate-check (--approve/--reverify) must pass --root <dir> or --scope <id> " +
-				"so CHECK approval binds the intended ledger. Use /unlazy-approve or /unlazy-reverify.",
+				"unlazy-guard (third-party): mutating gate-check (--approve/--reverify) must pass --root <dir> or --scope <id> " +
+				"so CHECK approval binds the intended ledger. Inspect with /unlazy-approve, then /unlazy-approve confirm.",
 		};
 	});
 
-	const runUserFacing = async (args: string[], ctx: any) => {
+	const notifyLong = (ctx: any, text: string, level: "info" | "warning" | "error") => {
+		ctx?.ui?.notify?.(text.slice(0, 500) || "(empty)", level);
+		try {
+			pi.appendEntry?.({
+				type: "unlazy-gate-check",
+				content: text,
+				exitCode: level === "info" ? 0 : 1,
+			});
+		} catch {
+			/* optional — session JSONL still holds the omp turn */
+		}
+	};
+
+	const inspectMutating = async (mode: "approve" | "reverify", ctx: any) => {
 		const cwd = cwdOf(ctx);
+		const status = await statusFor(cwd);
+		const statusText = (status.stdout || status.stderr || status.unmetHint || "").trim();
+		const ledgerText = collectLedgerPayload(cwd);
+		inspectedByCwd.set(cwd, { mode, at: Date.now() });
+		const body = formatInspectPayload({ cwd, mode, statusText, ledgerText });
+		notifyLong(ctx, body, "info");
+		return body;
+	};
+
+	const confirmMutating = async (mode: "approve" | "reverify", ctx: any) => {
+		const cwd = cwdOf(ctx);
+		const prior = inspectedByCwd.get(cwd);
+		if (!prior || prior.mode !== mode) {
+			const body =
+				`unlazy-guard (third-party): confirm refused — inspect first. ` +
+				`Run /unlazy-${mode} (no args) to see CHECK/EXPECT/status, then /unlazy-${mode} confirm.`;
+			notifyLong(ctx, body, "warning");
+			await inspectMutating(mode, ctx);
+			return;
+		}
 		const root = skillRoot();
 		if (!root) {
 			ctx?.ui?.notify?.("unlazy skill not found on this host", "error");
 			return;
 		}
-		const result = await runNode([gateCheckBin(root), ...args, "--root", cwd], cwd, 120000);
+		const flag = mode === "approve" ? "--approve" : "--reverify";
+		const result = await runNode([gateCheckBin(root), flag, "--root", cwd], cwd, 120000);
 		const text = (result.stdout || result.stderr || `exit ${result.code}`).trim();
-		ctx?.ui?.notify?.(text.slice(0, 500) || `exit ${result.code}`, result.code === 0 ? "info" : "warning");
-		try {
-			pi.appendEntry?.({
-				type: "unlazy-gate-check",
-				content: text,
-				exitCode: result.code,
-			});
-		} catch {
-			/* optional */
-		}
+		inspectedByCwd.delete(cwd);
+		notifyLong(ctx, text || `exit ${result.code}`, result.code === 0 ? "info" : "warning");
 	};
 
+	const mutatingHelp = (mode: "approve" | "reverify") =>
+		`unlazy-guard (third-party) /unlazy-${mode}: inspect-then-confirm.\n` +
+		`  /unlazy-${mode}          show CHECK/EXPECT and --status (does not execute)\n` +
+		`  /unlazy-${mode} confirm  run upstream gate-check ${mode === "approve" ? "--approve" : "--reverify"} after inspect\n` +
+		`A single-shot yes that hides the payload is refused.`;
+
 	pi.registerCommand?.("unlazy-status", {
-		description: "Unlazy: report GATES ledger status (no CHECK execution)",
-		handler: async (_args: string, ctx: any) => runUserFacing(["--status"], ctx),
+		description: "Unlazy (third-party guard): report GATES ledger status (no CHECK execution)",
+		handler: async (_args: string, ctx: any) => {
+			const cwd = cwdOf(ctx);
+			const root = skillRoot();
+			if (!root) {
+				ctx?.ui?.notify?.("unlazy skill not found on this host", "error");
+				return;
+			}
+			const result = await runNode([gateCheckBin(root), "--status", "--root", cwd], cwd, 120000);
+			const text = (result.stdout || result.stderr || `exit ${result.code}`).trim();
+			notifyLong(ctx, text || `exit ${result.code}`, result.code === 0 ? "info" : "warning");
+		},
 	});
 	pi.registerCommand?.("unlazy-reverify", {
-		description: "Unlazy: reverify runnable gates (demote stale)",
-		handler: async (_args: string, ctx: any) => runUserFacing(["--reverify"], ctx),
+		description: "Unlazy (third-party guard): inspect CHECK payload, then confirm to reverify",
+		handler: async (args: string, ctx: any) => {
+			const mode = parseSlashMode(args);
+			if (mode === "help") {
+				notifyLong(ctx, mutatingHelp("reverify"), "info");
+				return;
+			}
+			if (mode === "unknown") {
+				notifyLong(ctx, `unknown args ${JSON.stringify(args)}. ${mutatingHelp("reverify")}`, "warning");
+				return;
+			}
+			if (mode === "inspect") {
+				await inspectMutating("reverify", ctx);
+				return;
+			}
+			await confirmMutating("reverify", ctx);
+		},
 	});
 	pi.registerCommand?.("unlazy-approve", {
-		description: "Unlazy: approve pending oracles then run CHECKs",
-		handler: async (_args: string, ctx: any) => runUserFacing(["--approve"], ctx),
+		description: "Unlazy (third-party guard): inspect CHECK payload, then confirm to approve",
+		handler: async (args: string, ctx: any) => {
+			const mode = parseSlashMode(args);
+			if (mode === "help") {
+				notifyLong(ctx, mutatingHelp("approve"), "info");
+				return;
+			}
+			if (mode === "unknown") {
+				notifyLong(ctx, `unknown args ${JSON.stringify(args)}. ${mutatingHelp("approve")}`, "warning");
+				return;
+			}
+			if (mode === "inspect") {
+				await inspectMutating("approve", ctx);
+				return;
+			}
+			await confirmMutating("approve", ctx);
+		},
 	});
 	pi.registerCommand?.("unlazy-scopes", {
-		description: "Unlazy: list Depth Tree / .unlazy pipeline scopes",
+		description: "Unlazy (third-party guard): list Depth Tree / .unlazy pipeline scopes",
 		handler: async (_args: string, ctx: any) => {
 			const text = await listScopes(cwdOf(ctx));
 			ctx?.ui?.notify?.(text.slice(0, 500), "info");
@@ -311,9 +559,10 @@ export default function unlazyGuard(pi: any): void {
 	if (pi.registerTool && z) {
 		pi.registerTool({
 			name: "unlazy_status",
-			label: "Unlazy status",
+			label: "Unlazy status (third-party guard)",
 			description:
 				"Report Unlazy GATES ledger status for the current workspace (no CHECK execution). " +
+				"Unofficial third-party omp helper — not official Unlazy. " +
 				"Use before claiming work complete. Optional scope for Depth Tree pipelines under .unlazy/.",
 			parameters: z.object({
 				scope: z.string().optional().describe("Optional .unlazy/<scope> pipeline id"),
