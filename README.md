@@ -44,7 +44,7 @@ Do **not** `curl | bash` from `main`. The installer **refuses** floating refs (`
 2. Choose the immutable pin published with this tree (update this SHA when you cut a new commit you intend people to install):
 
 ```text
-PIN=REPLACE_WITH_COMMIT_SHA
+PIN=86c13c412573c3824d3d31848239ad21afcc863d
 ```
 
 3. Fetch the installer **from that same pin** (not from `main`), then inspect it:
