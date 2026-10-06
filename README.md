@@ -1,5 +1,7 @@
 # omp-unlazy-guard
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink)](https://github.com/sponsors/joshuaswarren)
+
 **Unofficial third-party** [omp / Oh My Pi](https://github.com/can1357/oh-my-pi) extension that brings [Unlazy](https://github.com/Leonxlnx/unlazy) completion discipline into live omp panes.
 
 This repository is **not** part of Unlazy, **not** affiliated with or endorsed by Leonxlnx, and **not** an official Unlazy companion. It only adds omp lifecycle hooks and slash commands. CHECK/EXPECT execution stays in upstream `gate-check.mjs`.
@@ -144,6 +146,14 @@ npm test
 ```
 
 CI: `.github/workflows/ci.yml` runs that command on every push and pull request.
+
+## Support
+
+Every bit of support helps keep omp-unlazy-guard alive and free. If you are able, [sponsor on GitHub](https://github.com/sponsors/joshuaswarren) or send a Lightning donation to `joshuaswarren@strike.me` to directly fund continued development and new integrations.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge)](https://github.com/sponsors/joshuaswarren)
+
+If financial support is not an option, you can still make a big difference: [star the repo](https://github.com/joshuaswarren/omp-unlazy-guard), share it, or recommend it to a colleague. Word of mouth is how most people find omp-unlazy-guard.
 
 ## License
 
